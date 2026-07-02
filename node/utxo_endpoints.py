@@ -44,6 +44,13 @@ _INT64_MAX = (1 << 63) - 1
 _NONCE_MAX_DIGITS = len(str(_INT64_MAX))
 
 
+class _TransferAbort(Exception):
+    def __init__(self, payload, status_code):
+        super().__init__(payload.get('error', 'UTXO transfer aborted'))
+        self.payload = payload
+        self.status_code = status_code
+
+
 def _parse_rtc_amount(raw) -> Decimal:
     """
     Parse an RTC amount as Decimal with bounds checking.
@@ -713,12 +720,11 @@ def utxo_transfer():
         conn.execute("BEGIN IMMEDIATE")
 
         if not _reserve_transfer_nonce(conn, from_address, nonce):
-            conn.rollback()
-            return jsonify({
+            raise _TransferAbort({
                 'error': 'Nonce already used (replay attack detected)',
                 'code': 'REPLAY_DETECTED',
                 'nonce': str(nonce),
-            }), 400
+            }, 400)
         previous_nonce = conn.execute(
             """
             SELECT MAX(CAST(nonce AS INTEGER)) FROM transfer_nonces
@@ -727,18 +733,18 @@ def utxo_transfer():
             (from_address, nonce),
         ).fetchone()[0]
         if previous_nonce is not None and int(previous_nonce) >= nonce_int:
-            conn.rollback()
-            return jsonify({
+            raise _TransferAbort({
                 'error': 'Signed transfer nonce must increase for this wallet',
                 'code': 'OUT_OF_ORDER_NONCE',
                 'nonce': nonce,
                 'latest_nonce': int(previous_nonce),
-            }), 400
+            }, 400)
 
         ok = _utxo_db.apply_transaction(tx, block_height, conn=conn)
         if not ok:
-            conn.rollback()
-            return jsonify({'error': 'UTXO transaction failed (race condition or validation)'}), 500
+            raise _TransferAbort({
+                'error': 'UTXO transaction failed (race condition or validation)'
+            }, 500)
 
         if _dual_write:
             amount_i64 = amount_i64_for_dual_write
@@ -755,13 +761,12 @@ def utxo_transfer():
             ).fetchone()
             shadow_balance = shadow_row[0] if shadow_row else 0
             if shadow_balance < debit_i64:
-                conn.rollback()
-                return jsonify({
+                raise _TransferAbort({
                     'error': 'Insufficient dual-write shadow balance',
                     'code': 'DUAL_WRITE_SHADOW_BALANCE',
                     'shadow_balance_i64': shadow_balance,
                     'required_i64': debit_i64,
-                }), 409
+                }, 409)
 
             conn.execute("INSERT OR IGNORE INTO balances (miner_id, amount_i64) VALUES (?, 0)",
                          (to_address,))
@@ -783,6 +788,12 @@ def utxo_transfer():
             )
 
         conn.commit()
+    except _TransferAbort as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return jsonify(e.payload), e.status_code
     except Exception:
         try:
             conn.rollback()

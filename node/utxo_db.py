@@ -1460,7 +1460,11 @@ class UtxoDB:
                 tx_id = row['tx_id']
                 try:
                     tx = json.loads(row['tx_data_json'])
-                    input_ids = [inp['box_id'] for inp in tx.get('inputs', [])]
+                    inputs = self._normalize_inputs(tx.get('inputs', []))
+                    if inputs is None:
+                        raise ValueError("invalid mempool inputs")
+                    input_ids = [inp['box_id'] for inp in inputs]
+                    tx['inputs'] = inputs
                     data_inputs = self._normalize_data_inputs(
                         tx.get('data_inputs', [])
                     )

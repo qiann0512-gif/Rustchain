@@ -238,10 +238,10 @@ def _verify_agent_signature(pubkey_hex, signature_hex, message):
         return False
 
 
-def _authenticate_contract_agent(db, allowed_agents, body_bytes):
+def _authenticate_contract_agent(db, allowed_agents, body_bytes, allow_legacy=True):
     allowed = {str(agent) for agent in allowed_agents if agent}
 
-    if os.environ.get('BEACON_ALLOW_LEGACY_AGENT_KEY') == '1':
+    if allow_legacy and os.environ.get('BEACON_ALLOW_LEGACY_AGENT_KEY') == '1':
         legacy_key = request.headers.get('X-Agent-Key', '')
         if legacy_key in allowed:
             return legacy_key, None
@@ -514,6 +514,7 @@ def beacon_join():
     Returns:
         - 200: Agent registered/updated successfully
         - 400: Invalid input (missing fields, invalid pubkey_hex format)
+        - 401: Existing agent update lacks a valid Beacon signature
 
     Upsert behavior: Duplicate agent_id updates existing record.
     """
@@ -596,6 +597,18 @@ def beacon_join():
         ).fetchone()
 
         if existing:
+            # Public key equality identifies the account but does not prove
+            # possession. Authenticate updates against the stored key and the
+            # exact request body before changing any mutable agent state.
+            body_bytes = request.get_data(cache=True)
+            authenticated_agent, auth_error = _authenticate_contract_agent(
+                db, {agent_id}, body_bytes, allow_legacy=False
+            )
+            if auth_error:
+                return auth_error
+            if authenticated_agent != agent_id:
+                return jsonify({'error': 'Beacon signature identity mismatch'}), 401
+
             # Agent exists — NEVER allow pubkey_hex overwrite.
             # Allowing unauthenticated pubkey changes is a full identity
             # takeover: attacker sends join with victim's agent_id and

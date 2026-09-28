@@ -1,5 +1,10 @@
+import hashlib
+import json
 import sqlite3
+import time
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from flask import Flask
 
 import beacon_api
@@ -69,11 +74,45 @@ def test_beacon_join_accepts_32_byte_ed25519_pubkey(tmp_path, monkeypatch):
     assert response.get_json()["ok"] is True
 
 
-def _join(client, agent_id, pubkey_hex="22" * 32, name=None):
+_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x22" * 32)
+_PUBKEY_HEX = _PRIVATE_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+).hex()
+
+
+def _join(client, agent_id, pubkey_hex=_PUBKEY_HEX, name=None):
     body = {"agent_id": agent_id, "pubkey_hex": pubkey_hex}
     if name is not None:
         body["name"] = name
-    return client.post("/beacon/join", json=body)
+    body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    nonce = f"join-{time.time_ns()}"
+    message = "\n".join([
+        "POST",
+        "/beacon/join",
+        hashlib.sha256(body_bytes).hexdigest(),
+        timestamp,
+        nonce,
+        agent_id,
+    ]).encode("utf-8")
+    headers = {
+        "X-Agent-Id": agent_id,
+        "X-Agent-Timestamp": timestamp,
+        "X-Agent-Nonce": nonce,
+        "X-Agent-Signature": _PRIVATE_KEY.sign(message).hex(),
+    }
+    return client.post(
+        "/beacon/join", data=body_bytes, content_type="application/json",
+        headers=headers,
+    )
+
+
+def _unsigned_join(client, agent_id, name):
+    return client.post(
+        "/beacon/join",
+        json={"agent_id": agent_id, "pubkey_hex": _PUBKEY_HEX, "name": name},
+    )
 
 
 def test_beacon_join_does_not_unban_banned_agent(tmp_path, monkeypatch):
@@ -116,3 +155,44 @@ def test_beacon_join_reactivates_inactive_agent(tmp_path, monkeypatch):
 
     assert response.get_json()["status"] == "active"
     assert _db_status("idle-agent") == "active"
+
+
+def test_beacon_join_rejects_unsigned_existing_agent_update(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    assert _join(client, "existing-agent", name="Original").status_code == 200
+    _set_status("existing-agent", "inactive")
+
+    response = _unsigned_join(client, "existing-agent", "Attacker Renamed")
+
+    assert response.status_code == 401
+    assert _db_status("existing-agent") == "inactive"
+    conn = sqlite3.connect(beacon_api.DB_PATH)
+    try:
+        name = conn.execute(
+            "SELECT name FROM relay_agents WHERE agent_id = ?",
+            ("existing-agent",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert name == "Original"
+
+
+def test_beacon_join_accepts_valid_signature_for_existing_agent(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    assert _join(client, "existing-agent", name="Original").status_code == 200
+    _set_status("existing-agent", "inactive")
+
+    response = _join(client, "existing-agent", name="Updated")
+
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "active"
+    assert _db_status("existing-agent") == "active"
+    conn = sqlite3.connect(beacon_api.DB_PATH)
+    try:
+        name = conn.execute(
+            "SELECT name FROM relay_agents WHERE agent_id = ?",
+            ("existing-agent",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert name == "Updated"
